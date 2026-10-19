@@ -56,3 +56,22 @@ It describes a versioned package at:
 Do not publish an unsigned bootstrap MSI as an OTA release. A signed package and
 device-side signer enrollment are required before automatic installation works.
 The dashboard backend remains responsible for uninstall/reporting alerts.
+
+## Automated build and signing
+
+Use **Actions ? Build, sign and publish Windows OTA ? Run workflow** in this
+repository. Enter a new version and choose whether to publish. GitHub builds
+from the private application repository using a dedicated read-only deploy key.
+The `Evidrune-Signing-PC` runner verifies and signs the MSI with the existing
+nonexportable Windows certificate, then publishes it here. The signing PC must
+be online with its signing Windows user logged in. No reinstall is required on
+PCs already enrolled by the 0.10.8 bootstrap.
+
+The local runner is reserved for trusted, owner-dispatched main-branch release
+jobs. External fork workflows require approval for every contributor. Do not
+approve untrusted fork workflows for this signing machine. The workflow does
+not check out source or execute downloaded scripts on the signing PC.
+
+Application source and the private signing key remain outside this repository.
+The app's reviewed release popup preserves the organization-management and
+browser-reporting disclosures. Published release versions are immutable.
