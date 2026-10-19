@@ -1,0 +1,9 @@
+*.msi
+*.pfx
+*.p12
+*.pem
+*.key
+.env
+.env.*
+windows.json
+release/
