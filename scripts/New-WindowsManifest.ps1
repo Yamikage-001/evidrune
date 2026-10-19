@@ -25,5 +25,6 @@ try {
         } finally {$view.Close()|Out-Null;[Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)|Out-Null}
     }
 } finally {[Runtime.InteropServices.Marshal]::FinalReleaseComObject($database)|Out-Null;[Runtime.InteropServices.Marshal]::FinalReleaseComObject($engine)|Out-Null}
-@{schemaVersion=1;version=$Version;size=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash;signed=$true}|ConvertTo-Json|Set-Content -LiteralPath $OutputPath -Encoding UTF8
+$json=@{schemaVersion=1;version=$Version;size=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash;signed=$true}|ConvertTo-Json
+[IO.File]::WriteAllText([IO.Path]::GetFullPath($OutputPath),$json,[Text.UTF8Encoding]::new($false))
 Write-Output ('Verified signed Windows OTA manifest: '+$OutputPath)
