@@ -1,0 +1,149 @@
+name: Build, sign and publish Windows OTA
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: MSI version, for example 1.0.1
+        required: true
+        type: string
+      publish:
+        description: Publish to the live GitHub OTA channel
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: signed-windows-release
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == 'Yamikage-001/evidrune' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: Dev-Ryuzakii/altris-forensic
+          ref: main
+          path: app
+          ssh-key: ${{ secrets.APP_SOURCE_SSH_KEY }}
+          persist-credentials: false
+      - name: Record application commit
+        id: source
+        shell: pwsh
+        run: '"sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '22'
+      - name: Prepare release version and popup
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$'){throw 'Use a numeric MSI version.'}
+          $parts=$env:RELEASE_VERSION.Split('.') | ForEach-Object {[long]$_}
+          if($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535){throw 'Version exceeds MSI limits.'}
+          $props=[xml](Get-Content Directory.Build.props -Raw)
+          $old=[string]$props.Project.PropertyGroup.Version
+          $props.Project.PropertyGroup.Version=$env:RELEASE_VERSION
+          $props.Project.PropertyGroup.FileVersion=$env:RELEASE_VERSION+'.0'
+          $props.Save((Join-Path $pwd 'Directory.Build.props'))
+          foreach($path in @('installer/Package.wxs','src/Agent/Program.cs','src/Agent/Setup.cs','src/Desktop/Program.cs')){
+            $text=[IO.File]::ReadAllText((Join-Path $pwd $path)).Replace($old,$env:RELEASE_VERSION)
+            [IO.File]::WriteAllText((Join-Path $pwd $path),$text,[Text.UTF8Encoding]::new($false))
+          }
+          # Use the reviewed release disclosure; working/development popup text is separate.
+          Copy-Item deploy/Release-Browser-Popup.html browser-extension/popup.html -Force
+          node tests/browser-popup.mjs
+          if($LASTEXITCODE -ne 0){throw 'Popup checks failed.'}
+          dotnet run --project tests/OtaTrustTests/OtaTrustTests.csproj -c Release
+          if($LASTEXITCODE -ne 0){throw 'OTA publisher checks failed.'}
+      - name: Build MSI
+        shell: powershell
+        run: ./build.ps1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-windows-msi
+          path: app/installer/bin/x64/Release/EvidruneAgent.msi
+          if-no-files-found: error
+          retention-days: 5
+  sign:
+    needs: build
+    permissions:
+      contents: write
+      actions: read
+    runs-on: [self-hosted, Windows, X64, evidrune-signing]
+    timeout-minutes: 20
+    steps:
+      # No source checkout or downloaded PowerShell execution on the signing PC.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unsigned-windows-msi
+          path: release
+      - name: Verify identity, sign and publish
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $pin='42D57113BE666F72008F2A911D1C5091BAE07358'
+          if($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$'){throw 'Invalid version.'}
+          $msi=(Resolve-Path release/EvidruneAgent.msi).Path
+          if((Get-Item $msi).Length -gt 104857600){throw 'MSI exceeds update size limit.'}
+          $engine=New-Object -ComObject WindowsInstaller.Installer
+          $database=$engine.OpenDatabase($msi,0)
+          try {
+            foreach($name in @('UpgradeCode','ProductVersion')){
+              $view=$database.OpenView("SELECT Value FROM Property WHERE Property = '$name'")
+              try {
+                $view.Execute();$record=$view.Fetch()
+                if(!$record){throw 'Missing MSI identity.'}
+                $value=$record.StringData(1)
+                if($name -eq 'UpgradeCode' -and $value -ne '{C1D6E1BD-13F8-4B7A-B6C6-A7226AE96C71}'){throw 'Unexpected MSI product.'}
+                if($name -eq 'ProductVersion' -and $value -ne $env:RELEASE_VERSION){throw 'MSI version mismatch.'}
+              } finally {$view.Close();[Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)|Out-Null}
+            }
+          } finally {[Runtime.InteropServices.Marshal]::FinalReleaseComObject($database)|Out-Null;[Runtime.InteropServices.Marshal]::FinalReleaseComObject($engine)|Out-Null}
+          $cert=Get-Item ('Cert:\CurrentUser\My\'+$pin)
+          if(!$cert.HasPrivateKey -or $cert.NotAfter -le (Get-Date)){throw 'Signing key unavailable or expired.'}
+          $signature=Set-AuthenticodeSignature -FilePath $msi -Certificate $cert -HashAlgorithm SHA256
+          if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $pin){throw 'Signature verification failed.'}
+          $manifest=@{schemaVersion=1;version=$env:RELEASE_VERSION;size=(Get-Item $msi).Length;sha256=(Get-FileHash $msi -Algorithm SHA256).Hash;signed=$true}|ConvertTo-Json
+          [IO.File]::WriteAllText((Join-Path $pwd 'release/windows.json'),$manifest,[Text.UTF8Encoding]::new($false))
+          $gh=$env:EVIDRUNE_GH_PATH
+          if(!$gh -or !(Test-Path -LiteralPath $gh)){throw 'GitHub CLI path is not configured on the signing runner.'}
+          try {
+            $tag='v'+$env:RELEASE_VERSION
+            # Existing releases are immutable. Use a new version after any published release.
+            $existing=& $gh release list --repo Yamikage-001/evidrune --limit 100 --json tagName
+            if($LASTEXITCODE -ne 0){throw 'Cannot inspect existing releases.'}
+            if(@($existing|ConvertFrom-Json|Where-Object tagName -EQ $tag).Count){throw 'Release already exists. Refusing to overwrite it.'}
+            & $gh release create $tag release/EvidruneAgent.msi release/windows.json --repo Yamikage-001/evidrune --title ('Evidrune '+$env:RELEASE_VERSION) --notes ('Managed Windows OTA; source commit '+$env:SOURCE_SHA+'. Signed by the enrolled Evidrune publisher. Browser monitoring disclosures remain visible.') --draft
+            if($LASTEXITCODE -ne 0){throw 'Draft release upload failed.'}
+            if($env:PUBLISH_RELEASE -eq 'true'){
+              & $gh release edit $tag --repo Yamikage-001/evidrune --draft=false --latest
+              if($LASTEXITCODE -ne 0){throw 'Release publication failed.'}
+            }
+          } finally {$env:GH_TOKEN=$null}
+      - name: Remove staging files
+        if: always()
+        shell: powershell
+        run: |
+          $path=[IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'release'))
+          if($path -ne [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) -and $path.StartsWith([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
