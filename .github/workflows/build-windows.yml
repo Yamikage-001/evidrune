@@ -57,7 +57,7 @@ jobs:
           $props=[xml](Get-Content Directory.Build.props -Raw)
           $old=[string]$props.Project.PropertyGroup.Version
           $props.Project.PropertyGroup.Version=$env:RELEASE_VERSION
-          $props.Project.PropertyGroup.FileVersion=$env:RELEASE_VERSION+'.0'
+          $props.Project.PropertyGroup.FileVersion='2.'+$env:RELEASE_VERSION
           $props.Save((Join-Path $pwd 'Directory.Build.props'))
           foreach($path in @('installer/Package.wxs','src/Agent/Program.cs','src/Agent/Setup.cs','src/Desktop/Program.cs')){
             $text=[IO.File]::ReadAllText((Join-Path $pwd $path)).Replace($old,$env:RELEASE_VERSION)
@@ -71,7 +71,10 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'OTA publisher checks failed.'}
       - name: Build MSI
         shell: powershell
-        run: ./build.ps1
+        run: |
+          ./build.ps1
+          if($LASTEXITCODE -ne 0){throw 'MSI build failed.'}
+          ./scripts/Test-UpgradePackage.ps1 -MsiPath ./installer/bin/x64/Release/EvidruneAgent.msi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: unsigned-windows-msi
