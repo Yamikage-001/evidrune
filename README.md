@@ -59,19 +59,21 @@ The dashboard backend remains responsible for uninstall/reporting alerts.
 
 ## Automated build and signing
 
-Use **Actions ? Build, sign and publish Windows OTA ? Run workflow** in this
-repository. Enter a new version and choose whether to publish. GitHub builds
-from the private application repository using a dedicated read-only deploy key.
-The `Evidrune-Signing-PC` runner verifies and signs the MSI with the existing
-nonexportable Windows certificate, then publishes it here. The signing PC must
-be online with its signing Windows user logged in. No reinstall is required on
-PCs already enrolled by the 0.10.8 bootstrap.
+Use **Actions > Build, sign and publish Windows OTA > Run workflow** here.
+Normal releases use the default `github` signer: GitHub builds the MSI, imports
+the CI certificate from encrypted Actions secrets on an ephemeral Windows
+runner, signs, verifies, and publishes it. No signing PC needs to be online.
+Source access uses a dedicated read-only deploy key; source remains private.
 
-The local runner is reserved for trusted, owner-dispatched main-branch release
-jobs. External fork workflows require approval for every contributor. Do not
-approve untrusted fork workflows for this signing machine. The workflow does
-not check out source or execute downloaded scripts on the signing PC.
+The `current-pc-transition` option is only for the old-signed 1.0.2 transition.
+0.10.8 PCs must receive that trust update before accepting releases signed by
+the new CI certificate. Keep the transition live until older PCs are enrolled.
+The new public fingerprint is `9AD037542E70F5EFE21B8DD607E9A88129D118AD`.
 
-Application source and the private signing key remain outside this repository.
-The app's reviewed release popup preserves the organization-management and
-browser-reporting disclosures. Published release versions are immutable.
+The MSI build checks executable versions against the legacy baseline and
+requires existing-product removal inside rollback. Version 1.0.1 was withdrawn
+after a file-version downgrade broke its upgrade; do not republish it.
+
+Only owner-dispatched main workflows may sign. Application source and private
+keys are not committed here. External fork workflows require approval. The
+release popup retains organization-management and browser-reporting notices.
