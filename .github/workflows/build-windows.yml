@@ -10,6 +10,13 @@ on:
         description: Publish to the live GitHub OTA channel
         type: boolean
         default: false
+      signer:
+        description: GitHub signing for normal releases; PC only for the one-time trust transition
+        type: choice
+        options:
+          - github
+          - current-pc-transition
+        default: github
 permissions:
   contents: read
 concurrency:
@@ -81,7 +88,8 @@ jobs:
           path: app/installer/bin/x64/Release/EvidruneAgent.msi
           if-no-files-found: error
           retention-days: 5
-  sign:
+  sign-transition:
+    if: inputs.signer == 'current-pc-transition'
     needs: build
     permissions:
       contents: write
@@ -149,4 +157,109 @@ jobs:
           $path=[IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'release'))
           if($path -ne [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) -and $path.StartsWith([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+  sign-hosted:
+    if: inputs.signer == 'github'
+    needs: build
+    permissions:
+      contents: write
+      actions: read
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      # No source checkout or downloaded PowerShell execution on the signing PC.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unsigned-windows-msi
+          path: release
+      - name: Import CI signing key on the ephemeral GitHub runner
+        shell: powershell
+        env:
+          CI_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          CI_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          CI_SIGNER_PIN: ${{ vars.WINDOWS_CI_SIGNER_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if($env:CI_SIGNER_PIN -notmatch '^[A-Fa-f0-9]{40}$'){throw 'CI signer pin is missing.'}
+          $pfx=Join-Path $env:RUNNER_TEMP 'evidrune-ci-signer.pfx'
+          [IO.File]::WriteAllBytes($pfx,[Convert]::FromBase64String($env:CI_PFX_BASE64))
+          $password=ConvertTo-SecureString $env:CI_PFX_PASSWORD.Trim() -AsPlainText -Force
+          $cert=Import-PfxCertificate -FilePath $pfx -Password $password -CertStoreLocation Cert:\CurrentUser\My
+          if($cert.Thumbprint -ne $env:CI_SIGNER_PIN -or !$cert.HasPrivateKey){throw 'CI signing key does not match the approved publisher.'}
+          $public=Join-Path $env:RUNNER_TEMP 'evidrune-ci-signer.cer'
+          Export-Certificate -Cert $cert -FilePath $public | Out-Null
+          Import-Certificate -FilePath $public -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Import-Certificate -FilePath $public -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+          [IO.File]::AppendAllText($env:GITHUB_ENV,('EVIDRUNE_GH_PATH='+((Get-Command gh).Source)+"`n"),[Text.UTF8Encoding]::new($false))
+      - name: Verify identity, sign and publish
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          CI_SIGNER_PIN: ${{ vars.WINDOWS_CI_SIGNER_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $pin=$env:CI_SIGNER_PIN
+          if($pin -notmatch '^[A-Fa-f0-9]{40}$'){throw 'CI signer pin is not configured.'}
+          if($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$'){throw 'Invalid version.'}
+          $msi=(Resolve-Path release/EvidruneAgent.msi).Path
+          if((Get-Item $msi).Length -gt 104857600){throw 'MSI exceeds update size limit.'}
+          $engine=New-Object -ComObject WindowsInstaller.Installer
+          $database=$engine.OpenDatabase($msi,0)
+          try {
+            foreach($name in @('UpgradeCode','ProductVersion')){
+              $view=$database.OpenView("SELECT Value FROM Property WHERE Property = '$name'")
+              try {
+                $view.Execute();$record=$view.Fetch()
+                if(!$record){throw 'Missing MSI identity.'}
+                $value=$record.StringData(1)
+                if($name -eq 'UpgradeCode' -and $value -ne '{C1D6E1BD-13F8-4B7A-B6C6-A7226AE96C71}'){throw 'Unexpected MSI product.'}
+                if($name -eq 'ProductVersion' -and $value -ne $env:RELEASE_VERSION){throw 'MSI version mismatch.'}
+              } finally {$view.Close();[Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)|Out-Null}
+            }
+          } finally {[Runtime.InteropServices.Marshal]::FinalReleaseComObject($database)|Out-Null;[Runtime.InteropServices.Marshal]::FinalReleaseComObject($engine)|Out-Null}
+          $cert=Get-Item ('Cert:\CurrentUser\My\'+$pin)
+          if(!$cert.HasPrivateKey -or $cert.NotAfter -le (Get-Date)){throw 'Signing key unavailable or expired.'}
+          $signature=Set-AuthenticodeSignature -FilePath $msi -Certificate $cert -HashAlgorithm SHA256
+          if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $pin){throw 'Signature verification failed.'}
+          $manifest=@{schemaVersion=1;version=$env:RELEASE_VERSION;size=(Get-Item $msi).Length;sha256=(Get-FileHash $msi -Algorithm SHA256).Hash;signed=$true}|ConvertTo-Json
+          [IO.File]::WriteAllText((Join-Path $pwd 'release/windows.json'),$manifest,[Text.UTF8Encoding]::new($false))
+          $gh=$env:EVIDRUNE_GH_PATH
+          if(!$gh -or !(Test-Path -LiteralPath $gh)){throw 'GitHub CLI path is not configured on the signing runner.'}
+          try {
+            $tag='v'+$env:RELEASE_VERSION
+            # Existing releases are immutable. Use a new version after any published release.
+            $existing=& $gh release list --repo Yamikage-001/evidrune --limit 100 --json tagName
+            if($LASTEXITCODE -ne 0){throw 'Cannot inspect existing releases.'}
+            if(@($existing|ConvertFrom-Json|Where-Object tagName -EQ $tag).Count){throw 'Release already exists. Refusing to overwrite it.'}
+            & $gh release create $tag release/EvidruneAgent.msi release/windows.json --repo Yamikage-001/evidrune --title ('Evidrune '+$env:RELEASE_VERSION) --notes ('Managed Windows OTA; source commit '+$env:SOURCE_SHA+'. Signed by the enrolled Evidrune publisher. Browser monitoring disclosures remain visible.') --draft
+            if($LASTEXITCODE -ne 0){throw 'Draft release upload failed.'}
+            if($env:PUBLISH_RELEASE -eq 'true'){
+              & $gh release edit $tag --repo Yamikage-001/evidrune --draft=false --latest
+              if($LASTEXITCODE -ne 0){throw 'Release publication failed.'}
+            }
+          } finally {$env:GH_TOKEN=$null}
+      - name: Remove staging files
+        if: always()
+        shell: powershell
+        run: |
+          $path=[IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'release'))
+          if($path -ne [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) -and $path.StartsWith([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Remove imported CI signing material
+        if: always()
+        shell: powershell
+        env:
+          CI_SIGNER_PIN: ${{ vars.WINDOWS_CI_SIGNER_THUMBPRINT }}
+        run: |
+          if($env:CI_SIGNER_PIN -match '^[A-Fa-f0-9]{40}$'){
+            foreach($store in @('My','Root','TrustedPublisher')){
+              Remove-Item -LiteralPath ('Cert:\CurrentUser\'+$store+'\'+$env:CI_SIGNER_PIN) -Force -ErrorAction SilentlyContinue
+            }
+          }
+          foreach($name in @('evidrune-ci-signer.pfx','evidrune-ci-signer.cer')){
+            Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP $name) -Force -ErrorAction SilentlyContinue
           }
