@@ -188,8 +188,8 @@ jobs:
           if($cert.Thumbprint -ne $env:CI_SIGNER_PIN -or !$cert.HasPrivateKey){throw 'CI signing key does not match the approved publisher.'}
           $public=Join-Path $env:RUNNER_TEMP 'evidrune-ci-signer.cer'
           Export-Certificate -Cert $cert -FilePath $public | Out-Null
-          Import-Certificate -FilePath $public -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
-          Import-Certificate -FilePath $public -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+          Import-Certificate -FilePath $public -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          Import-Certificate -FilePath $public -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           [IO.File]::AppendAllText($env:GITHUB_ENV,('EVIDRUNE_GH_PATH='+((Get-Command gh).Source)+"`n"),[Text.UTF8Encoding]::new($false))
       - name: Verify identity, sign and publish
         shell: powershell
@@ -256,8 +256,8 @@ jobs:
           CI_SIGNER_PIN: ${{ vars.WINDOWS_CI_SIGNER_THUMBPRINT }}
         run: |
           if($env:CI_SIGNER_PIN -match '^[A-Fa-f0-9]{40}$'){
-            foreach($store in @('My','Root','TrustedPublisher')){
-              Remove-Item -LiteralPath ('Cert:\CurrentUser\'+$store+'\'+$env:CI_SIGNER_PIN) -Force -ErrorAction SilentlyContinue
+            foreach($store in @('Cert:\CurrentUser\My','Cert:\LocalMachine\Root','Cert:\LocalMachine\TrustedPublisher')){
+              Remove-Item -LiteralPath ($store+'\'+$env:CI_SIGNER_PIN) -Force -ErrorAction SilentlyContinue
             }
           }
           foreach($name in @('evidrune-ci-signer.pfx','evidrune-ci-signer.cer')){
